@@ -1,0 +1,6 @@
+#ifndef STM32N6_ZEPHYR_AI_APP_HEARTBEAT_H_
+#define STM32N6_ZEPHYR_AI_APP_HEARTBEAT_H_
+
+int heartbeat_start(void);
+
+#endif /* STM32N6_ZEPHYR_AI_APP_HEARTBEAT_H_ */
