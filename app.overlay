@@ -1,5 +1,6 @@
 &usart1 {
 	current-speed = <1000000>;
+	fifo-enable;
 };
 
 &npu {
@@ -7,5 +8,5 @@
 };
 
 &npu_cache {
-	status = "disabled";
+	status = "okay";
 };

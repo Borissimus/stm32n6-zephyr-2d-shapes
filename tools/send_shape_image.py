@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Send one image or a test dataset to the CM55 shape recognizer over UART."""
+"""Reliably send Shapes2D RGB frames through the COBS UART protocol."""
 
 from __future__ import annotations
 
 import argparse
 import math
+import secrets
 import statistics
 import struct
 import sys
@@ -14,738 +15,322 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-FRAME_MAGIC = b"IMG0"
-VERIFIED_MAGIC = b"VHDR"
-CHUNK_MAGIC = b"CHNK"
+PROTOCOL_VERSION = 1
+PACKET_START = 1
+PACKET_DATA = 2
+PACKET_ABORT = 3
+PACKET_ACK_START = 0x81
+PACKET_ACK_DATA = 0x82
+PACKET_NACK = 0x83
+PACKET_RESULT = 0x84
+
 IMAGE_WIDTH = 96
 IMAGE_HEIGHT = 96
 IMAGE_CHANNELS = 3
 IMAGE_BYTES = IMAGE_WIDTH * IMAGE_HEIGHT * IMAGE_CHANNELS
-SUPPORTED_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
-DEFAULT_BAUD = 1000000
-DEFAULT_CHUNK_SIZE = 1024
-DEFAULT_INTER_CHUNK_DELAY = 0.0
-DEFAULT_RETRIES = 2
-DEFAULT_ACK_TIMEOUT = 2.0
-DEFAULT_CHUNK_RETRIES = 4
-DEFAULT_SESSION_OPEN_DELAY = 0.5
-DEFAULT_SYNC_TIMEOUT = 4.0
+CHUNK_BYTES = 1024
+CHUNK_COUNT = IMAGE_BYTES // CHUNK_BYTES
 CLASS_LABELS = ("circle", "square", "triangle")
+SUPPORTED_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
 
 
 @dataclass
-class InferenceRecord:
-    image_path: Path
-    expected_label: str
-    predicted_label: str
-    status: str
-    time_ms: float
-    score: float
-    index: int
-    scores: tuple[float, ...]
-    chunk_resends: int = 0
+class Record:
+    path: Path
+    expected: str
+    predicted: str
+    inference_ms: float
+    preprocess_ms: float
+    round_trip_ms: float
+    frame_retries: int
+    packet_retries: int
 
     @property
-    def is_correct(self) -> bool:
-        return self.predicted_label.lower() == self.expected_label.lower()
+    def correct(self) -> bool:
+        return self.expected.lower() == self.predicted.lower()
 
-    @property
-    def expected_index(self) -> int:
-        try:
-            return CLASS_LABELS.index(self.expected_label.lower())
-        except ValueError:
-            return -1
 
-    @property
-    def expected_score(self) -> float:
-        index = self.expected_index
-        if index < 0 or index >= len(self.scores):
-            return float("nan")
-        return self.scores[index]
-
-    @property
-    def score_gap(self) -> float:
-        expected_score = self.expected_score
-        if not math.isfinite(self.score) or not math.isfinite(expected_score):
-            return float("nan")
-        return self.score - expected_score
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Send one image or a directory of test images to the CM55 firmware, "
-            "then summarize inference timing and recognition results."
-        )
-    )
-    parser.add_argument("port", help="Serial port, for example /dev/ttyUSB0")
-    parser.add_argument(
-        "input_path",
-        help="Path to one image file or a dataset directory with class subdirectories.",
-    )
-    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="UART baud rate")
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=10.0,
-        help="Seconds to wait for one RESULT line",
-    )
-    parser.add_argument(
-        "--ack-timeout",
-        type=float,
-        default=DEFAULT_ACK_TIMEOUT,
-        help="Seconds to wait for one transport ACK/NACK line",
-    )
-    parser.add_argument(
-        "--open-delay",
-        type=float,
-        default=DEFAULT_SESSION_OPEN_DELAY,
-        help="Seconds to wait after opening the serial port",
-    )
-    parser.add_argument(
-        "--sync-timeout",
-        type=float,
-        default=DEFAULT_SYNC_TIMEOUT,
-        help="Seconds to wait for the board banner after opening the serial port",
-    )
-    parser.add_argument(
-        "--protocol",
-        choices=("verified", "legacy"),
-        default="verified",
-        help="UART transport mode to use",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=DEFAULT_CHUNK_SIZE,
-        help="Bytes to send per UART write",
-    )
-    parser.add_argument(
-        "--inter-chunk-delay",
-        type=float,
-        default=DEFAULT_INTER_CHUNK_DELAY,
-        help="Seconds to wait between UART write chunks",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Print only the summary section",
-    )
-    parser.add_argument(
-        "--retries",
-        type=int,
-        default=DEFAULT_RETRIES,
-        help="Additional attempts per image after a timeout",
-    )
-    parser.add_argument(
-        "--chunk-retries",
-        type=int,
-        default=DEFAULT_CHUNK_RETRIES,
-        help="Additional resend attempts per chunk after a NACK or ACK timeout",
-    )
-    parser.add_argument(
-        "--layout",
-        choices=("hwc", "chw"),
-        default="hwc",
-        help="How to flatten RGB pixels before sending them",
-    )
-    parser.add_argument(
-        "--channel-order",
-        choices=("rgb", "bgr"),
-        default="rgb",
-        help="Channel order to send to the device",
-    )
-    parser.add_argument(
-        "--invert",
-        action="store_true",
-        help="Invert pixel intensities before sending",
-    )
-    parser.add_argument(
-        "--grayscale",
-        action="store_true",
-        help="Convert the image to grayscale before sending",
-    )
-    parser.add_argument(
-        "--verbose-mistakes",
-        type=parse_verbose_mistakes,
-        default=0,
-        help="Print up to N misclassified images after the summary, or use 'all'",
-    )
-    return parser.parse_args()
-
-
-def parse_verbose_mistakes(value: str) -> int | None:
-    if value.lower() == "all":
-        return None
-
-    try:
-        limit = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "verbose-mistakes must be an integer or 'all'"
-        ) from exc
-
-    if limit < 0:
-        raise argparse.ArgumentTypeError(
-            "verbose-mistakes must be non-negative or 'all'"
-        )
-
-    return limit
-
-
-def load_image_bytes(
-    image_path: Path,
-    layout: str,
-    channel_order: str,
-    invert: bool,
-    grayscale: bool,
-) -> bytes:
-    try:
-        from PIL import Image
-    except ImportError as exc:  # pragma: no cover
-        raise SystemExit(
-            "Pillow is required. Install it with: pip install pillow"
-        ) from exc
-
-    image = Image.open(image_path).convert("RGB")
-    image = image.resize((IMAGE_WIDTH, IMAGE_HEIGHT))
-
-    if grayscale:
-        image = image.convert("L").convert("RGB")
-
-    if invert:
-        try:
-            from PIL import ImageOps
-        except ImportError as exc:  # pragma: no cover
-            raise SystemExit(
-                "Pillow ImageOps is required. Install it with: pip install pillow"
-            ) from exc
-        image = ImageOps.invert(image)
-
-    data = image.tobytes()
-
-    if len(data) != IMAGE_BYTES:
-        raise SystemExit(
-            f"Unexpected resized payload size {len(data)} bytes, expected {IMAGE_BYTES}"
-        )
-
-    if channel_order == "bgr":
-        pixels = [data[index:index + 3] for index in range(0, len(data), 3)]
-        data = b"".join(pixel[::-1] for pixel in pixels)
-
-    if layout == "chw":
-        pixels = [data[index:index + 3] for index in range(0, len(data), 3)]
-        red = bytes(pixel[0] for pixel in pixels)
-        green = bytes(pixel[1] for pixel in pixels)
-        blue = bytes(pixel[2] for pixel in pixels)
-        data = red + green + blue
-
-    return data
-
-
-def collect_image_paths(input_path: Path) -> list[Path]:
-    if input_path.is_file():
-        if input_path.suffix.lower() not in SUPPORTED_SUFFIXES:
-            raise SystemExit(f"Unsupported image file: {input_path}")
-        return [input_path]
-
-    if not input_path.is_dir():
-        raise SystemExit(f"Input path does not exist: {input_path}")
-
-    image_paths = sorted(
-        path for path in input_path.rglob("*")
-        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
-    )
-
-    if not image_paths:
-        raise SystemExit(f"No supported image files found under: {input_path}")
-
-    return image_paths
-
-
-def parse_result_line(line: str) -> dict[str, str]:
-    if not line.startswith("RESULT "):
-        raise ValueError(f"Unexpected device response: {line}")
-
-    result: dict[str, str] = {}
-    for token in line.split()[1:]:
-        if "=" not in token:
-            continue
-        key, value = token.split("=", 1)
-        result[key] = value
-
-    required_keys = {"status", "index", "label", "time_us", "scores_q"}
-    missing = required_keys.difference(result)
-    if missing:
-        raise ValueError(f"Missing fields in RESULT line: {sorted(missing)}")
-
-    return result
-
-
-def parse_key_value_tokens(line: str) -> dict[str, str]:
-    result: dict[str, str] = {}
-
-    for token in line.split()[2:]:
-        if "=" not in token:
-            continue
-        key, value = token.split("=", 1)
-        result[key] = value
-
-    return result
-
-
-def is_background_device_line(line: str) -> bool:
-    prefixes = (
-        "CM55 shape recognizer is ready.",
-        "Verified protocol:",
-        "Legacy protocol:",
-        "Self-test command:",
-        "Labels:",
-        "Unknown threshold:",
-        "Waiting for image frames...",
-        "Embedded self-test:",
-        "SELFTEST ",
-        "TRACE ",
-    )
-    return line.startswith(prefixes)
-
-
-def read_matching_line(ser, timeout: float, prefixes: tuple[str, ...]) -> str:
-    deadline = time.monotonic() + timeout
-
-    while time.monotonic() < deadline:
-        line = ser.readline()
-        if not line:
-            continue
-
-        decoded = line.decode("utf-8", errors="replace").strip()
-        if not decoded:
-            continue
-
-        if decoded.startswith(prefixes):
-            return decoded
-
-        if is_background_device_line(decoded):
-            continue
-
-    expected = ", ".join(prefixes)
-    raise TimeoutError(f"Timed out waiting for device line: {expected}")
-
-
-def sync_device_after_open(ser, sync_timeout: float) -> None:
-    if sync_timeout <= 0:
-        return
-
-    deadline = time.monotonic() + sync_timeout
-    saw_activity = False
-    last_activity = time.monotonic()
-
-    while time.monotonic() < deadline:
-        line = ser.readline()
-        if not line:
-            if not saw_activity:
-                return
-            if time.monotonic() - last_activity >= 0.3:
-                return
-            continue
-
-        decoded = line.decode("utf-8", errors="replace").strip()
-        if not decoded:
-            continue
-
-        saw_activity = True
-        last_activity = time.monotonic()
-
-        if decoded.startswith("Waiting for image frames..."):
-            return
-
-
-def read_result_line(ser, timeout: float) -> dict[str, str]:
-    return parse_result_line(read_matching_line(ser, timeout, ("RESULT ",)))
-
-
-def infer_expected_label(image_path: Path) -> str:
-    return image_path.parent.name
-
-
-def parse_scores(raw_scores: str) -> tuple[float, ...]:
-    """Parse STM32N6 output logits, transmitted as the original int8 values."""
-    return tuple(float(value) for value in raw_scores.split(","))
-
-
-def format_score_vector(scores: tuple[float, ...]) -> str:
-    pairs: list[str] = []
-
-    for index, score in enumerate(scores):
-        label = CLASS_LABELS[index] if index < len(CLASS_LABELS) else f"class_{index}"
-        pairs.append(f"{label}={score:.6f}")
-
-    return ", ".join(pairs)
-
-
-def format_stats(values: list[float]) -> str:
-    if not values:
-        return "avg=n/a min=n/a max=n/a median=n/a"
-
-    return (
-        f"avg={statistics.fmean(values):.3f} ms "
-        f"min={min(values):.3f} ms "
-        f"max={max(values):.3f} ms "
-        f"median={statistics.median(values):.3f} ms"
-    )
-
-
-def print_summary(records: list[InferenceRecord]) -> None:
-    total = len(records)
-    correct = sum(record.is_correct for record in records)
-    timeout_count = sum(record.status == "timeout" for record in records)
-    total_resends = sum(record.chunk_resends for record in records)
-    all_times = [record.time_ms for record in records if math.isfinite(record.time_ms)]
-
-    print("\nSummary")
-    print(
-        f"overall: images={total} correct={correct} timeouts={timeout_count} "
-        f"chunk_resends={total_resends} accuracy={100.0 * correct / total:.2f}% "
-        f"{format_stats(all_times)}"
-    )
-
-    expected_labels = sorted({record.expected_label for record in records})
-    for label in expected_labels:
-        label_records = [record for record in records if record.expected_label == label]
-        label_times = [
-            record.time_ms for record in label_records if math.isfinite(record.time_ms)
-        ]
-        label_correct = sum(record.is_correct for record in label_records)
-        label_timeouts = sum(record.status == "timeout" for record in label_records)
-        print(
-            f"{label}: images={len(label_records)} correct={label_correct} "
-            f"timeouts={label_timeouts} "
-            f"accuracy={100.0 * label_correct / len(label_records):.2f}% "
-            f"{format_stats(label_times)}"
-        )
-
-    print("confusion:")
-    for label in expected_labels:
-        label_records = [record for record in records if record.expected_label == label]
-        counts: dict[str, int] = {}
-
-        for record in label_records:
-            counts[record.predicted_label] = counts.get(record.predicted_label, 0) + 1
-
-        breakdown = ", ".join(
-            f"{predicted}={counts[predicted]}" for predicted in sorted(counts)
-        )
-        print(f"{label} -> {breakdown}")
-
-
-def print_mistake_details(records: list[InferenceRecord], limit: int | None) -> None:
-    if limit == 0:
-        return
-
-    mistakes = [
-        record
-        for record in records
-        if record.status != "timeout" and not record.is_correct
-    ]
-
-    if not mistakes:
-        print("mistakes: none")
-        return
-
-    print("mistakes:")
-    selected_mistakes = mistakes if limit is None else mistakes[:limit]
-    for record in selected_mistakes:
-        print(
-            f"{record.image_path}: expected={record.expected_label} "
-            f"predicted={record.predicted_label}(index={record.index}) "
-            f"predicted_score={record.score:.6f} "
-            f"expected_score={record.expected_score:.6f} "
-            f"score_gap={record.score_gap:.6f} "
-            f"scores=[{format_score_vector(record.scores)}]"
-        )
-
-
-def send_frame(
-    ser,
-    payload: bytes,
-    chunk_size: int,
-    inter_chunk_delay: float,
-) -> None:
-    data = FRAME_MAGIC + payload
-
-    for start in range(0, len(data), chunk_size):
-        ser.write(data[start:start + chunk_size])
-        ser.flush()
-        if inter_chunk_delay > 0:
-            time.sleep(inter_chunk_delay)
-
-
-class TransferError(RuntimeError):
+class ProtocolError(RuntimeError):
     pass
 
 
-def send_verified_frame(
-    ser,
-    payload: bytes,
-    chunk_size: int,
-    inter_chunk_delay: float,
-    ack_timeout: float,
-    chunk_retries: int,
-) -> int:
-    if chunk_size <= 0 or chunk_size > 1024:
-        raise ValueError("Verified transport chunk size must be in the range 1..1024")
+def cobs_encode(payload: bytes) -> bytes:
+    output = bytearray(b"\x00")
+    code_index = 0
+    code = 1
+    for value in payload:
+        if value == 0:
+            output[code_index] = code
+            code_index = len(output)
+            output.append(0)
+            code = 1
+        else:
+            output.append(value)
+            code += 1
+            if code == 0xFF:
+                output[code_index] = code
+                code_index = len(output)
+                output.append(0)
+                code = 1
+    output[code_index] = code
+    return bytes(output)
 
-    chunk_count = math.ceil(len(payload) / chunk_size)
-    image_crc32 = zlib.crc32(payload) & 0xFFFFFFFF
-    header = VERIFIED_MAGIC + struct.pack(
-        "<IHHI",
-        len(payload),
-        chunk_size,
-        chunk_count,
-        image_crc32,
+
+def cobs_decode(encoded: bytes) -> bytes:
+    output = bytearray()
+    index = 0
+    while index < len(encoded):
+        code = encoded[index]
+        index += 1
+        if code == 0 or index + code - 1 > len(encoded):
+            raise ProtocolError("invalid COBS frame")
+        output.extend(encoded[index:index + code - 1])
+        index += code - 1
+        if code != 0xFF and index < len(encoded):
+            output.append(0)
+    return bytes(output)
+
+
+def packet_start(session_id: int, image_crc: int) -> bytes:
+    return struct.pack(
+        "<BBIII", PROTOCOL_VERSION, PACKET_START, session_id, IMAGE_BYTES, image_crc
     )
-    chunk_packets: list[bytes] = []
-    for chunk_index, offset in enumerate(range(0, len(payload), chunk_size)):
-        chunk = payload[offset:offset + chunk_size]
-        chunk_crc32 = zlib.crc32(chunk) & 0xFFFFFFFF
-        chunk_packets.append(
-            CHUNK_MAGIC
-            + struct.pack("<HHI", chunk_index, len(chunk), chunk_crc32)
-            + chunk
-        )
 
-    total_resends = 0
 
-    # Keep one chunk queued ahead. This matches the USB CDC buffering behavior
-    # of the board far more reliably than a strict stop-and-wait exchange.
-    first_packet = FRAME_MAGIC + header + chunk_packets[0]
-    if chunk_count > 1:
-        first_packet += chunk_packets[1]
+def packet_data(session_id: int, sequence: int, payload: bytes) -> bytes:
+    if len(payload) != CHUNK_BYTES:
+        raise ValueError("all Shapes2D chunks must be exactly 1024 bytes")
+    return struct.pack("<BBIH", PROTOCOL_VERSION, PACKET_DATA, session_id, sequence) + payload
 
-    ser.write(first_packet)
+
+def packet_abort(session_id: int) -> bytes:
+    return struct.pack("<BBI", PROTOCOL_VERSION, PACKET_ABORT, session_id)
+
+
+def send_packet(ser, packet: bytes) -> None:
+    ser.write(cobs_encode(packet) + b"\x00")
     ser.flush()
-    if inter_chunk_delay > 0:
-        time.sleep(inter_chunk_delay)
 
-    next_chunk_to_send = 2 if chunk_count > 1 else 1
-    next_chunk_to_ack = 0
-    drain_sent = False
 
-    while next_chunk_to_ack < chunk_count:
-        response_line = read_matching_line(
-            ser,
-            ack_timeout,
-            ("ACK START", "NACK START", "ACK CHUNK", "NACK CHUNK", "ACK IMAGE", "NACK IMAGE"),
-        )
-
-        if response_line.startswith("NACK START"):
-            raise TransferError(response_line)
-
-        if response_line.startswith("ACK START"):
+def read_packet(ser, timeout: float) -> bytes:
+    deadline = time.monotonic() + timeout
+    encoded = bytearray()
+    while time.monotonic() < deadline:
+        data = ser.read(1)
+        if not data:
             continue
-
-        if response_line.startswith("NACK IMAGE"):
-            raise TransferError(response_line)
-
-        if response_line.startswith("ACK IMAGE"):
-            break
-
-        response = parse_key_value_tokens(response_line)
-        response_index = int(response.get("index", "-1"))
-        if response_index != next_chunk_to_ack:
-            raise TransferError(
-                f"Unexpected chunk response for {response_index}, expected {next_chunk_to_ack}: "
-                f"{response_line}"
-            )
-
-        if response_line.startswith("NACK CHUNK"):
-            total_resends += 1
-            raise TransferError(response_line)
-
-        next_chunk_to_ack += 1
-
-        if next_chunk_to_send < chunk_count:
-            ser.write(chunk_packets[next_chunk_to_send])
-            ser.flush()
-            if inter_chunk_delay > 0:
-                time.sleep(inter_chunk_delay)
-            next_chunk_to_send += 1
-        elif not drain_sent:
-            # One trailing byte encourages the CDC stack to release the final
-            # packet so the device can finish image CRC validation.
-            ser.write(b"\n")
-            ser.flush()
-            drain_sent = True
-
-    return total_resends
+        if data == b"\x00":
+            if not encoded:
+                continue
+            try:
+                return cobs_decode(bytes(encoded))
+            finally:
+                encoded.clear()
+        if len(encoded) >= 1100:
+            encoded.clear()
+            continue
+        encoded.extend(data)
+    raise TimeoutError("timed out waiting for a COBS response")
 
 
-def run_inference_session(
-    port: str,
-    baud: int,
-    image_paths: list[Path],
-    timeout: float,
-    ack_timeout: float,
-    open_delay: float,
-    sync_timeout: float,
-    protocol: str,
-    chunk_size: int,
-    inter_chunk_delay: float,
-    retries: int,
-    chunk_retries: int,
-    quiet: bool,
-    layout: str,
-    channel_order: str,
-    invert: bool,
-    grayscale: bool,
-) -> list[InferenceRecord]:
+def read_response(ser, session_id: int, timeout: float) -> bytes:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            packet = read_packet(ser, max(0.01, deadline - time.monotonic()))
+        except ProtocolError:
+            continue
+        if len(packet) >= 6 and packet[0] == PROTOCOL_VERSION:
+            response_session = struct.unpack_from("<I", packet, 2)[0]
+            if response_session == session_id:
+                return packet
+    raise TimeoutError("timed out waiting for matching response")
+
+
+def response_kind(packet: bytes) -> int:
+    if len(packet) < 2 or packet[0] != PROTOCOL_VERSION:
+        raise ProtocolError("invalid response version")
+    return packet[1]
+
+
+def parse_nack(packet: bytes) -> tuple[int, int]:
+    if len(packet) != 9:
+        raise ProtocolError("invalid NACK length")
+    _, _, _, reason, expected = struct.unpack("<BBIBH", packet)
+    return reason, expected
+
+
+def parse_result(packet: bytes) -> tuple[str, float, float, tuple[int, int, int]]:
+    if len(packet) != 19:
+        raise ProtocolError("invalid RESULT length")
+    _, _, _, status, index, inference_us, preprocess_us, score0, score1, score2 = struct.unpack(
+        "<BBIBBIIbbb", packet
+    )
+    if status != 0 or index >= len(CLASS_LABELS):
+        raise ProtocolError(f"board inference failed: status={status} index={index}")
+    return (
+        CLASS_LABELS[index],
+        inference_us / 1000.0,
+        preprocess_us / 1000.0,
+        (score0, score1, score2),
+    )
+
+
+def load_image(path: Path) -> bytes:
     try:
-        import serial
-    except ImportError as exc:  # pragma: no cover
-        raise SystemExit(
-            "pyserial is required. Install it with: pip install pyserial"
-        ) from exc
+        from PIL import Image
+    except ImportError as exc:
+        raise SystemExit("Pillow is required: python -m pip install pillow") from exc
 
-    def open_serial_port():
-        ser = serial.Serial(port=port, baudrate=baud, timeout=0.2)
-        if open_delay > 0:
-            time.sleep(open_delay)
-        ser.reset_input_buffer()
-        sync_device_after_open(ser, sync_timeout)
-        return ser
+    image = Image.open(path).convert("RGB").resize((IMAGE_WIDTH, IMAGE_HEIGHT))
+    payload = image.tobytes()
+    if len(payload) != IMAGE_BYTES:
+        raise RuntimeError(f"unexpected payload length: {len(payload)}")
+    return payload
 
-    records: list[InferenceRecord] = []
-    ser = open_serial_port()
 
-    try:
-        for image_path in image_paths:
-            payload = load_image_bytes(
-                image_path=image_path,
-                layout=layout,
-                channel_order=channel_order,
-                invert=invert,
-                grayscale=grayscale,
-            )
-            expected_label = infer_expected_label(image_path)
-            record: InferenceRecord | None = None
+def collect_images(input_path: Path) -> list[Path]:
+    if input_path.is_file():
+        return [input_path]
+    images = sorted(
+        path for path in input_path.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+    )
+    if not images:
+        raise SystemExit(f"no image files found under {input_path}")
+    return images
 
-            for attempt in range(retries + 1):
+
+def wait_for_start_ack(ser, session_id: int, image_crc: int, retries: int) -> int:
+    for attempt in range(retries + 1):
+        send_packet(ser, packet_start(session_id, image_crc))
+        try:
+            response = read_response(ser, session_id, 1.5)
+        except TimeoutError:
+            continue
+        if response_kind(response) == PACKET_ACK_START and len(response) == 6:
+            return attempt
+        if response_kind(response) == PACKET_NACK:
+            reason, _ = parse_nack(response)
+            raise ProtocolError(f"START rejected: reason={reason}")
+    raise TimeoutError("START ACK was not received")
+
+
+def transfer_image(ser, payload: bytes, packet_retries: int, frame_retries: int) -> tuple[str, float, float, float, int, int]:
+    image_crc = zlib.crc32(payload) & 0xFFFFFFFF
+    total_packet_retries = 0
+    started = time.monotonic()
+
+    for frame_attempt in range(frame_retries + 1):
+        session_id = secrets.randbits(32) or 1
+        total_packet_retries += wait_for_start_ack(ser, session_id, image_crc, packet_retries)
+        restart_frame = False
+
+        for sequence in range(CHUNK_COUNT):
+            chunk = payload[sequence * CHUNK_BYTES:(sequence + 1) * CHUNK_BYTES]
+            for packet_attempt in range(packet_retries + 1):
+                send_packet(ser, packet_data(session_id, sequence, chunk))
                 try:
-                    chunk_resends = 0
-                    if protocol == "verified":
-                        chunk_resends = send_verified_frame(
-                            ser=ser,
-                            payload=payload,
-                            chunk_size=chunk_size,
-                            inter_chunk_delay=inter_chunk_delay,
-                            ack_timeout=ack_timeout,
-                            chunk_retries=chunk_retries,
-                        )
-                    else:
-                        send_frame(ser, payload, chunk_size, inter_chunk_delay)
+                    response = read_response(ser, session_id, 1.5)
+                except TimeoutError:
+                    total_packet_retries += 1
+                    continue
 
-                    result = read_result_line(ser, timeout)
-                    record = InferenceRecord(
-                        image_path=image_path,
-                        expected_label=expected_label,
-                        predicted_label=result["label"],
-                        status=result["status"],
-                        time_ms=float(result["time_us"]) / 1000.0,
-                        score=max(parse_scores(result["scores_q"])),
-                        index=int(result["index"]),
-                        scores=parse_scores(result["scores_q"]),
-                        chunk_resends=chunk_resends,
+                kind = response_kind(response)
+                if sequence == CHUNK_COUNT - 1 and kind == PACKET_RESULT:
+                    predicted, inference_ms, preprocess_ms, _ = parse_result(response)
+                    return (
+                        predicted,
+                        inference_ms,
+                        preprocess_ms,
+                        (time.monotonic() - started) * 1000.0,
+                        frame_attempt,
+                        total_packet_retries,
                     )
-                    break
-                except (TimeoutError, TransferError):
-                    try:
-                        ser.reset_input_buffer()
-                    except serial.SerialException:
-                        ser.close()
-                        ser = open_serial_port()
-
-                    if attempt == retries:
-                        record = InferenceRecord(
-                            image_path=image_path,
-                            expected_label=expected_label,
-                            predicted_label="timeout",
-                            status="timeout",
-                            time_ms=float("nan"),
-                            score=float("nan"),
-                            index=-1,
-                            scores=tuple(),
-                            chunk_resends=0,
-                        )
-                    else:
-                        time.sleep(0.1)
-                except serial.SerialException:
-                    try:
-                        ser.close()
-                    except serial.SerialException:
-                        pass
-
-                    if attempt == retries:
-                        raise
-
-                    time.sleep(0.5)
-                    ser = open_serial_port()
-
-            if record is None:  # pragma: no cover
-                raise SystemExit(f"Internal error while processing {image_path}")
-
-            records.append(record)
-
-            if not quiet:
-                if record.status == "timeout":
-                    print(
-                        f"{record.image_path}: expected={record.expected_label} "
-                        f"predicted=Unknown status=timeout after {retries + 1} attempts"
-                    )
+                if kind == PACKET_ACK_DATA and len(response) == 8:
+                    _, _, _, acknowledged = struct.unpack("<BBIH", response)
+                    if acknowledged == sequence and sequence != CHUNK_COUNT - 1:
+                        total_packet_retries += packet_attempt
+                        break
+                elif kind == PACKET_NACK:
+                    reason, expected = parse_nack(response)
+                    if expected == sequence and packet_attempt < packet_retries:
+                        total_packet_retries += 1
+                        continue
+                    if reason in (6, 7):
+                        restart_frame = True
+                        break
                 else:
-                    verdict = "OK" if record.is_correct else "MISS"
-                    resend_suffix = (
-                        f" chunk_resends={record.chunk_resends}"
-                        if protocol == "verified"
-                        else ""
-                    )
-                    print(
-                        f"{record.image_path}: expected={record.expected_label} "
-                        f"predicted={record.predicted_label}(index={record.index}) "
-                        f"status={record.status} time_ms={record.time_ms:.3f} "
-                        f"score={record.score:.6f} "
-                        f"scores=[{format_score_vector(record.scores)}]{resend_suffix} {verdict}"
-                    )
-    finally:
-        ser.close()
+                    raise ProtocolError(f"unexpected response type={kind} for chunk={sequence}")
+            else:
+                restart_frame = True
 
-    return records
+            if restart_frame:
+                send_packet(ser, packet_abort(session_id))
+                break
+        if restart_frame:
+            continue
+    raise TimeoutError("image transfer failed after frame retries")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("port")
+    parser.add_argument("input_path", type=Path)
+    parser.add_argument("--baud", type=int, default=1000000)
+    parser.add_argument("--packet-retries", type=int, default=3)
+    parser.add_argument("--frame-retries", type=int, default=2)
+    parser.add_argument("--limit", type=int, help="Maximum number of input images to send")
+    parser.add_argument("--quiet", action="store_true")
+    return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    input_path = Path(args.input_path).expanduser().resolve()
-    image_paths = collect_image_paths(input_path)
-    records = run_inference_session(
-        port=args.port,
-        baud=args.baud,
-        image_paths=image_paths,
-        timeout=args.timeout,
-        ack_timeout=args.ack_timeout,
-        open_delay=args.open_delay,
-        sync_timeout=args.sync_timeout,
-        protocol=args.protocol,
-        chunk_size=args.chunk_size,
-        inter_chunk_delay=args.inter_chunk_delay,
-        retries=args.retries,
-        chunk_retries=args.chunk_retries,
-        quiet=args.quiet,
-        layout=args.layout,
-        channel_order=args.channel_order,
-        invert=args.invert,
-        grayscale=args.grayscale,
+    if args.packet_retries < 0 or args.frame_retries < 0:
+        raise SystemExit("retry counts must be non-negative")
+    if args.limit is not None and args.limit <= 0:
+        raise SystemExit("--limit must be positive")
+    try:
+        import serial
+    except ImportError as exc:
+        raise SystemExit("pyserial is required: python -m pip install pyserial") from exc
+
+    records: list[Record] = []
+    with serial.Serial(args.port, args.baud, timeout=0.1) as ser:
+        time.sleep(0.2)
+        ser.reset_input_buffer()
+        image_paths = collect_images(args.input_path.resolve())
+        if args.limit is not None:
+            image_paths = image_paths[:args.limit]
+        for path in image_paths:
+            payload = load_image(path)
+            predicted, inference_ms, preprocess_ms, round_trip_ms, frame_retries, packet_retries = transfer_image(
+                ser, payload, args.packet_retries, args.frame_retries
+            )
+            record = Record(
+                path, path.parent.name, predicted, inference_ms, preprocess_ms,
+                round_trip_ms, frame_retries, packet_retries
+            )
+            records.append(record)
+            if not args.quiet:
+                verdict = "OK" if record.correct else "MISS"
+                print(
+                    f"{path}: expected={record.expected} predicted={record.predicted} {verdict} "
+                    f"npu_ms={record.inference_ms:.3f} prep_ms={record.preprocess_ms:.3f} "
+                    f"round_trip_ms={record.round_trip_ms:.3f} frame_retries={record.frame_retries} "
+                    f"packet_retries={record.packet_retries}",
+                    flush=True,
+                )
+
+    correct = sum(record.correct for record in records)
+    times = [record.round_trip_ms for record in records]
+    print("\nSummary")
+    print(
+        f"images={len(records)} correct={correct} accuracy={100.0 * correct / len(records):.2f}% "
+        f"round_trip_avg={statistics.fmean(times):.3f} ms "
+        f"round_trip_min={min(times):.3f} ms round_trip_max={max(times):.3f} ms"
     )
-    print_summary(records)
-    print_mistake_details(records, args.verbose_mistakes)
     return 0
 
 

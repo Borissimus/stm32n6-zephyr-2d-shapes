@@ -2,7 +2,7 @@
   ******************************************************************************
   * @file    shapes_mobilenet_v2.h
   * @author  STEdgeAI
-  * @date    2026-07-13 13:58:03
+  * @date    2026-09-01 22:34:02
   * @brief   Minimal description of the generated c-implemention of the network
   ******************************************************************************
   * @attention

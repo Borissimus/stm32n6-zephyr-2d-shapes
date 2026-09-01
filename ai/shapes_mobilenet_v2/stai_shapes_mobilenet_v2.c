@@ -628,7 +628,7 @@ static const stai_network_info __stai_shapes_mobilenet_v2_network_info = {
     .n_weights = STAI_SHAPES_MOBILENET_V2_WEIGHTS_NUM,
     .n_states = STAI_SHAPES_MOBILENET_V2_STATES_NUM,
 
-    .c_model_datetime = "2026-07-13 13:58:02",
+    .c_model_datetime = "2026-09-01 22:34:01",
 
     .n_nodes = 146,
 

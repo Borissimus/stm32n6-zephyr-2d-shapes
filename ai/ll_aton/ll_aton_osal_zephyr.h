@@ -66,6 +66,7 @@ extern "C"
   void aton_osal_zephyr_enter_cs(void);
   void aton_osal_zephyr_exit_cs(void);
 
+
 /*** Zephyr dependent type macros ***/
 #define _DaoMutexNoWaitersType_ struct k_mutex
 #define _DaoWaitQueueType_      struct k_sem
@@ -104,6 +105,7 @@ extern "C"
     k_sem_give(sem);
     return 0;
   }
+
 
 /*** Zephyr function macros ***/
 #define _CreateDaoMutexNoWaiters_(_dao_obj, _dao_static_buffer) _my_zephyr_mutex_create(&(_dao_obj))

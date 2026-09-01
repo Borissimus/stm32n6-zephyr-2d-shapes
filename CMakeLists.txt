@@ -25,6 +25,7 @@ target_include_directories(app PRIVATE
 
 target_sources(app PRIVATE
   src/main.c
+  src/shapes_uart_transport.c
   src/heartbeat.c
   src/shapes_classifier.c
   src/stm32n6_external_flash.c

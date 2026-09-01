@@ -7,6 +7,7 @@
 
 #include "stai.h"
 #include "stai_shapes_mobilenet_v2.h"
+#include "ll_aton_NN_interface.h"
 
 #include "shapes_classifier.h"
 #include "stm32n6_npu_preinit.h"

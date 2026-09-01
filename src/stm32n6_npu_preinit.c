@@ -19,6 +19,15 @@ LOG_MODULE_REGISTER(stm32n6_npu_preinit, LOG_LEVEL_INF);
 static bool g_preinit_done;
 static bool g_xspi_preinit_done;
 
+/* Required by the ST NPU runtime before HAL_CACHEAXI_Init(). */
+void npu_cache_enable_clocks_and_reset(void)
+{
+	__HAL_RCC_CACHEAXIRAM_MEM_CLK_ENABLE();
+	__HAL_RCC_CACHEAXI_CLK_ENABLE();
+	__HAL_RCC_CACHEAXI_FORCE_RESET();
+	__HAL_RCC_CACHEAXI_RELEASE_RESET();
+}
+
 static uint32_t get_risaf_max_addr(RISAF_TypeDef *risaf)
 {
 	if ((risaf == RISAF2_S) || (risaf == RISAF2_NS)) {
@@ -79,6 +88,7 @@ static void preinit_common_clocks_and_memory(void)
 	__HAL_RCC_CRC_CLK_ENABLE();
 	__HAL_RCC_CACHEAXI_CLK_ENABLE();
 	__HAL_RCC_XSPIM_CLK_ENABLE();
+	__HAL_RCC_XSPIPHYCOMP_CLK_ENABLE();
 	__HAL_RCC_XSPIPHYCOMP_CLK_SLEEP_ENABLE();
 	__HAL_RCC_XSPI2_CLK_ENABLE();
 	__HAL_RCC_RIFSC_CLK_ENABLE();
@@ -91,6 +101,11 @@ static void preinit_common_clocks_and_memory(void)
 	__HAL_RCC_XSPI2_CLK_SLEEP_ENABLE();
 	__HAL_RCC_CACHEAXI_CLK_SLEEP_ENABLE();
 	__HAL_RCC_NPU_CLK_SLEEP_ENABLE();
+	__HAL_RCC_AXISRAM3_MEM_CLK_SLEEP_ENABLE();
+	__HAL_RCC_AXISRAM4_MEM_CLK_SLEEP_ENABLE();
+	__HAL_RCC_AXISRAM5_MEM_CLK_SLEEP_ENABLE();
+	__HAL_RCC_AXISRAM6_MEM_CLK_SLEEP_ENABLE();
+	__HAL_RCC_CACHEAXIRAM_MEM_CLK_SLEEP_ENABLE();
 
 	LOG_DBG("pre-init: memenr");
 	RCC->MEMENR |= RCC_MEMENR_AXISRAM3EN | RCC_MEMENR_AXISRAM4EN |
