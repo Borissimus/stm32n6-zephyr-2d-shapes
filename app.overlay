@@ -1,0 +1,12 @@
+&usart1 {
+	current-speed = <1000000>;
+	fifo-enable;
+};
+
+&npu {
+	status = "okay";
+};
+
+&npu_cache {
+	status = "okay";
+};

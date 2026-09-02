@@ -1,0 +1,22 @@
+manifest:
+  version: "0.13"
+
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.4.0
+      import: true
+
+    # ST ISP glue and middleware for the STM32N6 DCMIPP pixel pipeline.
+    - name: zephyr-stm32-mw-isp
+      url: https://github.com/stm32-hotspot/zephyr-stm32-mw-isp.git
+      revision: 4540e611e64dc04e82881f40999a26b34c54b71e
+      path: st/lib/zephyr-stm32-mw-isp
+      submodules: true
+
+  self:
+    path: app
